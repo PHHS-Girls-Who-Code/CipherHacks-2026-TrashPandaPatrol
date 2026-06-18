@@ -144,3 +144,13 @@ Use responsibly. No safety product is perfect. Encourage communication. Not a su
 ---
 
 ### Made for [CipherHacks 2026](<https://cipherhacks.tech>)
+
+Developers:
+  - Rinoja Heath
+  - Soliana Bogale
+  - Tina HagueAI
+
+AI Agents:
+- Claude
+- Grok
+- Gemini
