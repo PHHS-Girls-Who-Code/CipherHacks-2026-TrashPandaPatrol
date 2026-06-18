@@ -14,6 +14,9 @@ import base64
 import logging
 import logging.handlers
 import subprocess
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime
 from io import BytesIO
 
@@ -27,10 +30,6 @@ try:
     import requests
 except ImportError:
     requests = None
-try:
-    from twilio.rest import Client as TwilioClient
-except ImportError:
-    TwilioClient = None
 
 import pystray
 from pystray import MenuItem as item
@@ -147,15 +146,19 @@ CATEGORIES = [
 
 DEFAULT_SETTINGS = {
     "password_hash": None,
-    "phone_number": "",
 
     "screen_monitoring_enabled": False,
     "phone_notifications_enabled": False,
     "enabled_categories": {cat: True for cat in CATEGORIES},
     "monitor_interval_seconds": 35,
-    "twilio_sid": "",
-    "twilio_token": "",
-    "twilio_from_phone": ""
+
+    # ---- Free email alerts via Gmail SMTP ----
+    # gmail_address  : the Gmail account that SENDS the alert (the "from")
+    # gmail_app_password : a 16-char Google "App Password" (NOT your normal password)
+    # parent_email   : where the alert is delivered (the "to"); can be the same Gmail
+    "gmail_address": "",
+    "gmail_app_password": "",
+    "parent_email": "",
 }
 
 # ------------- Config Class -------------
@@ -696,15 +699,15 @@ class TrashPandaPatrolApp:
 
         ctk.CTkLabel(pass_frame, text="🔐 Access Protected • Changes auto-saved", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=8)
 
-        # Parent Phone
+        # Parent Email (where alerts are delivered)
         contact_frame = ctk.CTkFrame(self.settings_window)
         contact_frame.pack(padx=20, pady=6, fill="x")
 
-        ctk.CTkLabel(contact_frame, text="Parent Phone Number (E.164: +15551234567) — leave blank to disable SMS", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
-        self.phone_var = tk.StringVar(value=self.config.get("phone_number", ""))
-        phone_entry = ctk.CTkEntry(contact_frame, textvariable=self.phone_var, placeholder_text="+1XXXXXXXXXX", width=340)
-        phone_entry.pack(padx=12, pady=4)
-        phone_entry.bind("<FocusOut>", lambda e: self._autosave_phone())
+        ctk.CTkLabel(contact_frame, text="Parent Email (RECEIVER) — any email that should receive the alerts. No password needed. Leave blank to disable email alerts.", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+        self.parent_email_var = tk.StringVar(value=self.config.get("parent_email", ""))
+        email_entry = ctk.CTkEntry(contact_frame, textvariable=self.parent_email_var, placeholder_text="parent@example.com", width=340)
+        email_entry.pack(padx=12, pady=4)
+        email_entry.bind("<FocusOut>", lambda e: self._autosave_parent_email())
 
         # Note: the OpenRouter API key is provided only via the OPEN_ROUTER_API_KEY environment variable (never stored in the app config).
 
@@ -732,29 +735,31 @@ class TrashPandaPatrolApp:
             sw.pack(anchor="w", padx=14, pady=3)
             self.cat_vars[cat] = var
 
-        # Phone Notifications
+        # Email Notifications
         notif_frame = ctk.CTkFrame(self.settings_window)
         notif_frame.pack(padx=20, pady=10, fill="x")
-        self.notif_switch = ctk.CTkSwitch(notif_frame, text="📱 Send automated SMS warnings to parent phone (requires valid number + Twilio below if using images)",
+        self.notif_switch = ctk.CTkSwitch(notif_frame, text="📧 Email automated warnings to the parent email (with screenshot)",
                                            command=self._toggle_notifications)
         self.notif_switch.pack(pady=6, padx=10, anchor="w")
         if self.config.get("phone_notifications_enabled"):
             self.notif_switch.select()
 
-        # Twilio (optional)
-        twilio_frame = ctk.CTkFrame(self.settings_window)
-        twilio_frame.pack(padx=20, pady=(0,10), fill="x")
-        ctk.CTkLabel(twilio_frame, text="Twilio Settings (OPTIONAL — only needed for MMS image alerts)", anchor="w", font=ctk.CTkFont(size=12)).pack(padx=10, pady=4)
-        self.tw_sid_var = tk.StringVar(value=self.config.get("twilio_sid", ""))
-        self.tw_token_var = tk.StringVar(value=self.config.get("twilio_token", ""))
-        self.tw_from_var = tk.StringVar(value=self.config.get("twilio_from_phone", ""))
-        for lbl, svar in [("Account SID", self.tw_sid_var), ("Auth Token", self.tw_token_var), ("Twilio From Phone (+1..)", self.tw_from_var)]:
-            rowf = ctk.CTkFrame(twilio_frame)
+        # Gmail sender (free email via Gmail SMTP)
+        gmail_frame = ctk.CTkFrame(self.settings_window)
+        gmail_frame.pack(padx=20, pady=(0,10), fill="x")
+        ctk.CTkLabel(gmail_frame, text="Email Sender (SENDER) — the Gmail account used to send alerts. Can be different from the receiver above.",
+                     anchor="w", font=ctk.CTkFont(size=12)).pack(padx=10, pady=4)
+        ctk.CTkLabel(gmail_frame, text="Make an App Password at myaccount.google.com/apppasswords (2-Step Verification must be on).",
+                     anchor="w", font=ctk.CTkFont(size=10), text_color="#64748b").pack(padx=10, pady=(0, 4))
+        self.gmail_addr_var = tk.StringVar(value=self.config.get("gmail_address", ""))
+        self.gmail_pw_var = tk.StringVar(value=self.config.get("gmail_app_password", ""))
+        for lbl, svar in [("Gmail Address", self.gmail_addr_var), ("App Password", self.gmail_pw_var)]:
+            rowf = ctk.CTkFrame(gmail_frame)
             rowf.pack(fill="x", padx=8)
             ctk.CTkLabel(rowf, text=lbl, width=130).pack(side="left", pady=3)
-            ent = ctk.CTkEntry(rowf, textvariable=svar, width=420, show="•" if "token" in lbl.lower() else "")
+            ent = ctk.CTkEntry(rowf, textvariable=svar, width=420, show="•" if "password" in lbl.lower() else "")
             ent.pack(side="left", pady=2, padx=4)
-            ent.bind("<FocusOut>", lambda e: self._autosave_twilio())
+            ent.bind("<FocusOut>", lambda e: self._autosave_gmail())
 
         # Bottom controls
         action_frame = ctk.CTkFrame(self.settings_window, fg_color="transparent")
@@ -822,16 +827,17 @@ class TrashPandaPatrolApp:
 
     def _toggle_notifications(self):
         val = bool(self.notif_switch.get())
-        self.config.set("phone_notifications_enabled", val and bool(self.config.get("phone_number")))
+        self.config.set("phone_notifications_enabled", val and bool(self.config.get("parent_email")))
 
-    def _autosave_phone(self):
-        self.config.set("phone_number", self.phone_var.get().strip())
+    def _autosave_parent_email(self):
+        self.config.set("parent_email", self.parent_email_var.get().strip())
 
-    def _autosave_twilio(self):
+    def _autosave_gmail(self):
         self.config.update({
-            "twilio_sid": self.tw_sid_var.get().strip(),
-            "twilio_token": self.tw_token_var.get().strip(),
-            "twilio_from_phone": self.tw_from_var.get().strip()
+            "gmail_address": self.gmail_addr_var.get().strip(),
+            # App passwords are often shown with spaces ("abcd efgh ijkl mnop");
+            # strip them so login works regardless of how it was pasted.
+            "gmail_app_password": self.gmail_pw_var.get().replace(" ", "").strip(),
         })
 
     def _change_password_dialog(self):
@@ -928,8 +934,14 @@ class TrashPandaPatrolApp:
                         saved_path = save_screenshot(img, tag=matched_cat[:15].replace(" ", "-"))
                         print(f"[TrashPandaPatrol] TRIGGERED by {matched_cat} | saved {saved_path}")
                         self._show_warning_in_thread(warning_msg)
-                        if self.config.get("phone_notifications_enabled") and self.config.get("phone_number"):
-                            self._send_sms_alert(warning_msg, matched_cat, saved_path)
+                        if self.config.get("phone_notifications_enabled") and self.config.get("parent_email"):
+                            # Run email send off the monitor thread so a slow SMTP
+                            # connection never delays the next scan.
+                            threading.Thread(
+                                target=self._send_email_alert,
+                                args=(warning_msg, matched_cat, saved_path),
+                                daemon=True,
+                            ).start()
                     else:
                         print(f"[TrashPandaPatrol] Suspicious but category '{cat}' not in enabled or not matched.")
                 else:
@@ -960,75 +972,60 @@ class TrashPandaPatrolApp:
         else:
             logger.warning("[TrashPandaPatrol] No UI root available; skipping warning popup.")
 
-    def upload_image_temp(self, img_path: str) -> str:
+    def _send_email_alert(self, warning_text: str, category: str, img_path: str):
         """
-        Upload a screenshot to a free anonymous temp host so it can be attached to an MMS
-        (Twilio needs a public media_url; it cannot read a local file path).
-        Returns a public URL string, or None on any failure (caller falls back to text SMS).
-        The hosted file is temporary and used only for delivering the alert image.
+        Send a free email alert to the parent via Gmail SMTP, attaching the
+        screenshot. Requires a Gmail address + a 16-char Google "App Password"
+        (generated at https://myaccount.google.com/apppasswords with 2-Step
+        Verification turned on). No Twilio, no cost, no phone number needed.
         """
-        if not requests or not img_path or not os.path.exists(img_path):
-            return None
-        # Try tmpfiles.org first, then 0x0.st as a fallback.
-        try:
-            with open(img_path, "rb") as f:
-                resp = requests.post(
-                    "https://tmpfiles.org/api/v1/upload",
-                    files={"file": (os.path.basename(img_path), f, "image/png")},
-                    timeout=20,
-                )
-            if resp.ok:
-                data = resp.json()
-                page_url = data.get("data", {}).get("url", "")
-                if page_url:
-                    # Convert viewer URL -> direct download URL for MMS media.
-                    # https://tmpfiles.org/12345/x.png -> https://tmpfiles.org/dl/12345/x.png
-                    return page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
-        except Exception as e:
-            print("[TrashPandaPatrol] tmpfiles upload failed:", e)
-        try:
-            with open(img_path, "rb") as f:
-                resp = requests.post(
-                    "https://0x0.st",
-                    files={"file": (os.path.basename(img_path), f, "image/png")},
-                    headers={"User-Agent": "TrashPandaPatrol/1.0"},
-                    timeout=20,
-                )
-            if resp.ok:
-                url = resp.text.strip()
-                if url.startswith("http"):
-                    return url
-        except Exception as e:
-            print("[TrashPandaPatrol] 0x0.st upload failed:", e)
-        return None
-
-    def _send_sms_alert(self, warning_text: str, category: str, img_path: str):
-        phone = self.config.get("phone_number")
-        if not phone or not TwilioClient:
+        sender = (self.config.get("gmail_address") or "").strip()
+        app_pw = (self.config.get("gmail_app_password") or "").replace(" ", "")
+        recipient = (self.config.get("parent_email") or "").strip()
+        if not recipient:
+            # If no separate parent email is set, fall back to emailing the sender.
+            recipient = sender
+        if not (sender and app_pw and recipient):
+            print("[TrashPandaPatrol] Email alert skipped: set Gmail address, App Password, and parent email.")
             return
-        sid = self.config.get("twilio_sid")
-        token = self.config.get("twilio_token")
-        from_phone = self.config.get("twilio_from_phone")
-        if not (sid and token and from_phone):
-            # Try plain SMS note (cannot attach)
-            print("[TrashPandaPatrol] Missing Twilio creds. SMS alerts need Twilio account.")
-            return
+
         try:
-            client = TwilioClient(sid, token)
-            body = f"🗑️ TRASHPANDAPATROL ALERT (Child Device)\nCategory: {category}\nWarning shown: {warning_text}\n\nCheck child's recent activity. A screenshot is attached if delivery supports MMS; it is also saved locally on the device."
+            msg = EmailMessage()
+            msg["Subject"] = f"TrashPandaPatrol Alert: {category}"
+            msg["From"] = sender
+            msg["To"] = recipient
+            msg.set_content(
+                "TRASHPANDAPATROL ALERT (Child Device)\n"
+                f"Category: {category}\n"
+                f"Warning shown to child: {warning_text}\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "A screenshot of the moment is attached (also saved locally on the device).\n"
+                "Please check in with your child about their recent online activity."
+            )
 
-            # Attempt to attach the screenshot via a temporary public URL (MMS).
-            media_url = self.upload_image_temp(img_path)
-            kwargs = {"body": body, "from_": from_phone, "to": phone}
-            if media_url:
-                kwargs["media_url"] = [media_url]
-            else:
-                print("[TrashPandaPatrol] Screenshot upload unavailable; sending text-only SMS.")
+            # Attach the screenshot if available.
+            if img_path and os.path.exists(img_path):
+                try:
+                    with open(img_path, "rb") as f:
+                        img_data = f.read()
+                    msg.add_attachment(
+                        img_data, maintype="image", subtype="png",
+                        filename=os.path.basename(img_path)
+                    )
+                except Exception as e:
+                    print("[TrashPandaPatrol] Could not attach screenshot:", e)
 
-            msg = client.messages.create(**kwargs)
-            print(f"[TrashPandaPatrol] {'MMS' if media_url else 'SMS'} sent:", msg.sid)
+            # Gmail SMTP over SSL (port 465).
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
+                server.login(sender, app_pw)
+                server.send_message(msg)
+            print(f"[TrashPandaPatrol] Email alert sent to {recipient}.")
+        except smtplib.SMTPAuthenticationError:
+            print("[TrashPandaPatrol] Email auth failed. Use a Gmail APP PASSWORD "
+                  "(not your normal password) and enable 2-Step Verification.")
         except Exception as e:
-            print("SMS send fail:", e)
+            print("[TrashPandaPatrol] Email send fail:", e)
 
     # ---- Tray Icon ----
     def _open_logs(self):
