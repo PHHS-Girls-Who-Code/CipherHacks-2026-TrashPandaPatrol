@@ -27,22 +27,36 @@ TrashPandaPatrol is an installable desktop safety tool that monitors on-screen a
 - **Notifications**: If enabled, sends SMS to parent with warning summary. Screenshot saved locally.
 - Auto-save + live application of settings
 
-Uses **Gemini Vision** (free tier) for complex intent/context analysis of screenshots (not naive keyword matching).
+Uses an **OpenRouter vision model** for complex intent/context analysis of screenshots (not naive keyword matching).
 
 ## Prerequisites
 - Windows 10/11
 - Python 3.10+ (for building from source)
-- A free Google Gemini API key: https://aistudio.google.com/app/apikey  (SAFE USAGE: set as environment variable - never hardcode)
+- An OpenRouter API key: https://openrouter.ai/keys  (SAFE USAGE: set as environment variable - never hardcode)
 - (Optional) Twilio account for real SMS: https://www.twilio.com/try-twilio (gives trial credit)
+- (Optional) Tesseract OCR engine: enables a local text pre-filter so the app only calls
+  the paid vision model when there is actually readable text on screen. Install from
+  https://github.com/UB-Mannheim/tesseract/wiki and ensure `tesseract.exe` is on your PATH.
+  If Tesseract is not installed, the app still works — it simply skips the OCR pre-filter.
 
-## Safe Gemini API Key (IMPORTANT)
+## Cost Optimization
+To keep LLM usage low without losing detection quality, captures are:
+- **Downscaled** (long edge ~1536px) and sent as **JPEG (q82)** — cost is driven by image
+  resolution/tiles, not file bytes, and high-contrast on-screen text stays legible.
+- **Frame-diffed** — if the screen has not changed since the last scan, the (paid) LLM call
+  is skipped and the interval backs off while the screen is static.
+- **OCR pre-filtered** (if Tesseract is installed) — screens with no readable text never
+  reach the LLM.
+The full-resolution PNG is still saved locally as evidence for any triggered alert.
 
-The app **no longer asks for or stores** the Gemini key in any UI or config file. To use:
+## Safe OpenRouter API Key (IMPORTANT)
+
+The app **no longer asks for or stores** the API key in any UI or config file. To use:
 
 Set the key as an environment variable before running:
 
 ```powershell
-$env:GEMINI_API_KEY = "AIzaSyYourRealKeyHere"
+$env:OPEN_ROUTER_API_KEY = "sk-or-v1-YourRealKeyHere"
 cd RaccoonSafe   # (folder can be manually renamed to TrashPandaPatrol; internal app name is already updated)
 .\.venv\Scripts\python main.py   # or double-click the built exe after setting the env permanently via System Properties
 ```
@@ -60,15 +74,15 @@ cd RaccoonSafe   # (folder can be manually renamed to TrashPandaPatrol; internal
    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. Set your key and run:
-   ```powershell
-   $env:GEMINI_API_KEY = "your_key"
-   .\.venv\Scripts\python.exe main.py
-   ```
+    ```powershell
+    $env:OPEN_ROUTER_API_KEY = "your_key"
+    .\.venv\Scripts\python.exe main.py
+    ```
+   Watch the terminal for startup messages. No main window appears by design.
 5. On first launch, you will be prompted to set the parent password.
-6. Open Settings from system tray (right-click icon) to configure phone number + toggles.
-7. Enable "Screen Monitoring" — the app will start analyzing if GEMINI_API_KEY is set.
-
-   The app always runs minimized in your system tray (trash panda / raccoon icon).
+6. The app runs only as a system tray icon (raccoon). Look in the notification area (click the ^ chevron if hidden). Right-click icon -> "Open Settings".
+7. Enable "Screen Monitoring" in settings — the app will start analyzing if OPEN_ROUTER_API_KEY is set.
+   Console shows guidance like "Tray active...".
 
 ## Building a Windows Installable .exe
 
@@ -85,22 +99,36 @@ To give user an installer you can wrap with Inno Setup or NSIS or simply distrib
 
 Auto startup: The app intends to run via tray; add shortcut in %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup for best.
 
-## Recommended Gemini Model
-Currently configured for `gemini-1.5-flash` which is free with generous limits.
+## Recommended Model
+Currently configured for `google/gemma-4-31b-it:free` via OpenRouter — a **free**,
+vision-capable model (good for demos at $0; has rate limits). Change `OPENROUTER_MODEL` in
+`main.py` to `google/gemini-2.0-flash-001` (paid, extremely cheap, more reliable) or any
+other OpenRouter vision model if you hit free-tier rate limits.
+
+> Free model slugs on OpenRouter change and retire over time. If the app logs an
+> `OpenRouter HTTP 404: No endpoints found for ...`, the configured free model was
+> removed — pick a current free vision model from https://openrouter.ai/models and
+> update `OPENROUTER_MODEL` in `main.py`.
 
 ## Limitations & Privacy Notes
 - Application captures screenshots periodically when monitoring is enabled.
 - Screenshots of suspicious events are saved locally to `%APPDATA%\TrashPandaPatrol\screenshots`.
+- **MMS image alerts:** When phone notifications are enabled **and** Twilio is configured, a
+  suspicious-event screenshot is briefly uploaded to a free temporary public image host
+  (tmpfiles.org, with 0x0.st as fallback) so it can be attached to the MMS sent to the
+  parent. This upload happens **only** for events that trigger an alert. If the upload
+  fails, the app automatically falls back to a text-only SMS. If you do not want any image
+  to leave the device, leave Twilio unconfigured (warnings and local screenshots still work).
 - Sensitive data such as APIs and phone are stored locally only in plaintext JSON (AppData).
-- No telemetry shipped off this device except API calls explicitly to Google Gemini and optionally Twilio.
-- All detection stays on-device except explicit image data submitted to Gemini model.
+- No telemetry shipped off this device except API calls explicitly to OpenRouter and optionally Twilio.
+- All detection stays on-device except explicit image data submitted to the OpenRouter model.
 - Recommend you tell children this software exists and the goal is keeping them safe.
 
 ## Running without Python users (for distribution)
 Just distribute the `dist/TrashPandaPatrol.exe` file created with PyInstaller. No admin install required except if you want to create Start Menu / run at login shortcut.
 
 ## Modifying warning behavior
-Tweak SYSTEM prompt in main.py inside class SafetyDetector. Gemini excellent at contextual interpretation rather than keyword.
+Tweak the prompt in main.py inside class SafetyDetector. Vision models are excellent at contextual interpretation rather than keyword.
 
 ## Assets
 The code draws a cute raccoon vector at runtime (no external required). You may place `assets/raccoon.png` if you want to swap it.

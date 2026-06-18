@@ -1,7 +1,7 @@
 """
 TrashPandaPatrol - Child Cybersecurity Safety App
 Parent-controlled Windows monitoring app for kids 16 and under.
-Uses Gemini Vision to analyze screenshots.
+Uses an OpenRouter vision model to analyze screenshots.
 """
 import os
 import sys
@@ -11,6 +11,9 @@ import hashlib
 import threading
 import tempfile
 import base64
+import logging
+import logging.handlers
+import subprocess
 from datetime import datetime
 from io import BytesIO
 
@@ -20,7 +23,10 @@ from tkinter import messagebox, simpledialog
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import mss
-import google.generativeai as genai
+try:
+    import requests
+except ImportError:
+    requests = None
 try:
     from twilio.rest import Client as TwilioClient
 except ImportError:
@@ -36,7 +42,99 @@ os.makedirs(APPDATA, exist_ok=True)
 CONFIG_FILE = os.path.join(APPDATA, "settings.json")
 SCREENSHOTS_DIR = os.path.join(APPDATA, "screenshots")
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+LOG_FILE = os.path.join(APPDATA, "trashpanda.log")
 RACOON_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "raccoon.png")  # optional external
+
+# ------------- Cost / capture tuning -------------
+# Downscale the screenshot's long edge to this many pixels before sending to the LLM.
+# ~1536 keeps small chat text legible while keeping the image to a low, predictable
+# number of vision "tiles" (cost is driven by resolution -> tokens, not file bytes).
+LLM_MAX_EDGE = 1536
+# JPEG quality for the LLM payload. High-contrast on-screen text is unaffected at ~82,
+# but the payload shrinks dramatically vs PNG.
+LLM_JPEG_QUALITY = 82
+# Frame-diff: if a downscaled grayscale thumbnail is nearly identical to the previous
+# scan, skip the (paid) LLM call. Mean per-pixel difference threshold (0-255).
+FRAME_DIFF_THRESHOLD = 4.0
+FRAME_DIFF_THUMB = 64  # thumbnail edge used for cheap comparison
+
+# ------------- OpenRouter (LLM) -------------
+# OpenRouter exposes an OpenAI-compatible chat-completions API. We send the screenshot
+# as a base64 data URL image part. Pick any vision-capable model slug here.
+# Using a FREE vision model for the demo ($0). Has rate limits but our frame-diff
+# skip keeps call volume low. Swap to "google/gemini-2.0-flash-001" (paid,
+# extremely cheap) if you hit free-tier rate limits or want more reliability.
+# NOTE: free model slugs on OpenRouter change/retire over time. If you get an
+# HTTP 404 "No endpoints found", check https://openrouter.ai/models for a current
+# free vision model and update OPENROUTER_MODEL below.
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+# Fallback vision models tried (in order) when the primary returns HTTP 429
+# (rate-limited upstream). All free; the shared free pool throttles aggressively,
+# so trying a second/third model often gets a result without paying anything.
+# Put a paid model here (e.g. "google/gemini-2.0-flash-001") if you add credits and
+# want guaranteed availability.
+OPENROUTER_FALLBACK_MODELS = [
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-4-26b-a4b-it:free",
+]
+# How many times to retry a single model on a 429 before moving to the next model.
+OPENROUTER_MAX_RETRIES = 2
+OPENROUTER_RETRY_BASE_SLEEP = 3  # seconds; multiplied by attempt number (linear backoff)
+
+
+
+# ------------- Logging -------------
+logger = logging.getLogger(APP_NAME)
+
+
+def setup_logging():
+    """
+    Configure logging to a rotating file in AppData (works even in the windowed
+    .exe build where there is no console). Also keep console output when one exists.
+    Existing print(...) calls are routed through the logger so all messages persist.
+    """
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    # Rotating file handler: 1 MB x 3 backups keeps the log small but useful.
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+
+    # Console handler only if a real stdout exists (running from source / console build).
+    if sys.stdout is not None:
+        try:
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setFormatter(fmt)
+            logger.addHandler(ch)
+        except Exception:
+            pass
+
+    # Route existing print(...) calls in this module through the logger so nothing
+    # is lost in the windowed .exe. Returns the original print for anything that needs it.
+    import builtins
+    _orig_print = builtins.print
+
+    def _logged_print(*args, **kwargs):
+        try:
+            msg = " ".join(str(a) for a in args)
+            logger.info(msg)
+        except Exception:
+            try:
+                _orig_print(*args, **kwargs)
+            except Exception:
+                pass
+
+    builtins.print = _logged_print
+    logger.info("==== %s logging started ====", APP_NAME)
 
 CATEGORIES = [
     "Hate Speech & Harassment",
@@ -122,20 +220,23 @@ class ConfigManager:
         self.save()
 
 
-# ------------- Gemini & Detection -------------
+# ------------- OpenRouter & Detection -------------
 class SafetyDetector:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.model = None
-        if api_key:
-            try:
-                genai.configure(api_key=api_key)
-                self.model = genai.GenerativeModel("gemini-2.0-flash")
-            except Exception as e:
-                print("Gemini setup failed:", e)
+        self.model = OPENROUTER_MODEL
+        self.ready = bool(api_key) and requests is not None
+        if api_key and requests is None:
+            print("OpenRouter setup failed: 'requests' package not installed.")
 
     def is_ready(self):
-        return self.model is not None
+        return self.ready
+
+    @staticmethod
+    def _image_to_data_url(image: Image.Image) -> str:
+        """Encode a PIL image as a base64 JPEG data URL for the chat image part."""
+        b64 = base64.b64encode(jpeg_bytes(image)).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
 
     def analyze_screenshot(self, image: Image.Image, enabled_cats: list) -> dict:
         """
@@ -152,18 +253,25 @@ Look specifically ONLY for visible text messages, usernames, pop-over text, and 
 THREAT CATEGORIES (only flag if enabled):
 {chr(10).join(f"- {c}" for c in enabled_cats)}
 
-Key red flag behaviors (consider language patterns, intent, context for kids):
+Key red flag behaviors (consider language patterns, intent, context for kids - DO NOT miss these):
+
+MUST FLAG as Personal Data Requests (Phishing / Social Engineering):
+- \"where do you live?\", \"I have your location!\", \"Give me money\", any question about home/school/address/location + \"I have/know your...\"
+
+MUST FLAG as Violence & Gore:
+- \"Gore\", \"Bleeds\", blood, kill , gore images or threats.
+
 - Asking for, guessing or coaxing personal info: address, school, real name, phone, age, location, photos, password, parent's info.
 - Social engineering & impersonation typical in Roblox/Fortnite/Minecraft/Discord/Kids apps.
 - Explicit sexual, nudity, grooming references or slang suggesting it.
 - Hate speech, slurs, targeted harassment, bullying, threats.
 - Promotion of violence, gore, weapons.
 - Encouragement of self-harm, suicide, eating disorders.
-- Offers that seem phishing/scams: "free robux", "free v-bucks", "click link for prize", "confirm with password".
+- Offers that seem phishing/scams: \"free robux\", \"free v-bucks\", \"click link for prize\", \"confirm with password\".
 - Illegal drugs, bombs, hacking tips, etc. aimed at minor.
-- General suspicious chat: requests to "keep a secret", "dont tell your mom", "send me a pic".
+- General suspicious chat: requests to \"keep a secret\", \"dont tell your mom\", \"send me a pic\".
 
-The analysis should understand context and conversational tone, not exact keywords only.
+The analysis should understand context and conversational tone, not exact keywords only. Add extra sensitivity to child-targeted chat.
 
 IF nothing risky appears, return exactly:
 {{
@@ -185,8 +293,75 @@ Return ONLY JSON (add nothing before or after):
 STRICT: Output MUST be valid compact JSON only.
 """
         try:
-            response = self.model.generate_content([prompt, image])
-            text = response.text.strip()
+            # Cost optimization: downscale to a low, predictable tile count and send a
+            # JPEG-encoded copy. High-contrast on-screen text stays legible.
+            payload_img = downscale_for_llm(image)
+            data_url = self._image_to_data_url(payload_img)
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                # Optional OpenRouter attribution headers.
+                "HTTP-Referer": "https://github.com/CipherHacks-2026/TrashPandaPatrol",
+                "X-Title": "TrashPandaPatrol",
+            }
+
+            def build_body(model_slug):
+                return {
+                    "model": model_slug,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": data_url}},
+                            ],
+                        }
+                    ],
+                    # Ask for JSON-only output where the model/provider supports it.
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                    "max_tokens": 400,
+                }
+
+            # Try the primary model, then each fallback. For each model, retry a few
+            # times on HTTP 429 (rate-limited upstream) with a short linear backoff.
+            # The free shared pool throttles aggressively, so a second model often
+            # succeeds at $0 instead of dropping the scan entirely.
+            response = None
+            models_to_try = [self.model] + list(OPENROUTER_FALLBACK_MODELS)
+            for model_slug in models_to_try:
+                for attempt in range(1, OPENROUTER_MAX_RETRIES + 1):
+                    resp = requests.post(
+                        OPENROUTER_API_URL, headers=headers, json=build_body(model_slug), timeout=60
+                    )
+                    if resp.ok:
+                        response = resp
+                        break
+                    if resp.status_code == 429:
+                        # Rate-limited. Back off and retry the same model, unless we're
+                        # out of attempts, in which case fall through to the next model.
+                        if attempt < OPENROUTER_MAX_RETRIES:
+                            sleep_s = OPENROUTER_RETRY_BASE_SLEEP * attempt
+                            print(f"OpenRouter 429 on {model_slug} (attempt {attempt}); retrying in {sleep_s}s.")
+                            time.sleep(sleep_s)
+                            continue
+                        print(f"OpenRouter 429 on {model_slug}; trying next model.")
+                        break
+                    # Non-429 error (e.g. 404 retired model, 400): log and try next model.
+                    print(f"OpenRouter HTTP {resp.status_code} on {model_slug}: {resp.text[:200]}")
+                    break
+                if response is not None:
+                    break
+
+            if response is None:
+                # Every model was rate-limited or errored. Skip this scan; the next
+                # cycle will try again (and the screen may have changed anyway).
+                print("OpenRouter: all models unavailable this cycle (likely rate-limited).")
+                return {"suspicious": False}
+
+            data = response.json()
+            text = data["choices"][0]["message"]["content"].strip()
             if text.startswith("```"):
                 text = text.split("```")[1].replace("json", "").strip()
             import re
@@ -198,7 +373,7 @@ STRICT: Output MUST be valid compact JSON only.
                     return {"suspicious": False}
                 return result
         except Exception as e:
-            print("Gemini detection error:", e)
+            print("OpenRouter detection error:", e)
         return {"suspicious": False}
 
 
@@ -219,41 +394,115 @@ def save_screenshot(img: Image.Image, tag: str = "") -> str:
     return path
 
 
+def downscale_for_llm(img: Image.Image, max_edge: int = LLM_MAX_EDGE) -> Image.Image:
+    """Return a copy scaled so its longest edge is <= max_edge (never upscales)."""
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= max_edge:
+        return img
+    scale = max_edge / float(longest)
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return img.resize(new_size, Image.LANCZOS)
+
+
+def jpeg_bytes(img: Image.Image, quality: int = LLM_JPEG_QUALITY) -> bytes:
+    """
+    Encode the image as JPEG in-memory and return the raw bytes. High-contrast
+    on-screen text is unaffected at ~q82 while the payload shrinks vs PNG.
+    RGBA is flattened to RGB for JPEG.
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def frame_thumbnail_bytes(img: Image.Image) -> bytes:
+    """Tiny grayscale thumbnail used for cheap frame-to-frame comparison."""
+    thumb = img.convert("L").resize((FRAME_DIFF_THUMB, FRAME_DIFF_THUMB), Image.BILINEAR)
+    return thumb.tobytes()
+
+
+def frames_are_similar(prev: bytes, curr: bytes) -> bool:
+    """
+    True if two thumbnails are nearly identical (mean per-pixel abs diff below
+    FRAME_DIFF_THRESHOLD). Pure-Python, no numpy dependency.
+    """
+    if prev is None or curr is None or len(prev) != len(curr):
+        return False
+    total = 0
+    for a, b in zip(prev, curr):
+        total += a - b if a > b else b - a
+    mean_diff = total / float(len(curr))
+    return mean_diff < FRAME_DIFF_THRESHOLD
+
+
 # ------------- Warning Popup UI -------------
 class WarningPopup:
     def __init__(self, parent_app):
         self.app = parent_app
         self.root = None
+        self.veil = None
+        self.panel = None
         self.can_close = False
         self.dim_alpha = 0.65
 
+    def is_open(self) -> bool:
+        """True if a warning popup (veil or panel) is currently displayed."""
+        for win in (self.panel, self.veil):
+            try:
+                if win is not None and win.winfo_exists():
+                    return True
+            except Exception:
+                pass
+        return False
+
     def show(self, message: str):
-        # Use root of main but separate overlay
-        self.root = ctk.CTkToplevel()
-        self.root.attributes("-fullscreen", True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 1)
-        self.root.configure(bg="black")
-        self.root.overrideredirect(True)
-        self.root.focus_force()
+        # If a popup is already on screen, do not stack another one on top.
+        if self.is_open():
+            logger.info("[TrashPandaPatrol] Warning already open; not opening another popup.")
+            return
 
-        # Full black dim layer
-        dim_canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
-        dim_canvas.pack(fill="both", expand=True)
-        dim_canvas.create_rectangle(0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
-                                    fill="#1a1a1a", outline="")
-        dim_canvas.update_idletasks()
+        self.can_close = False
 
-        # Pop-up content - Corner warning panel
+        # ---- Window 1: fullscreen DIM VEIL (semi-transparent so the real screen
+        # stays visible-but-darkened behind it, "to give focus" to the warning). ----
+        self.veil = ctk.CTkToplevel()
+        self.veil.attributes("-fullscreen", True)
+        self.veil.attributes("-topmost", True)
+        self.veil.configure(bg="black")
+        self.veil.overrideredirect(True)
+        # True dim: the desktop shows through, darkened. dim_alpha=0.65 => 65% black veil.
+        self.veil.attributes("-alpha", self.dim_alpha)
+        self.veil.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.veil.bind("<Escape>", lambda e: "break")
+        self.veil.bind("<Button-1>", lambda e: "break")
+
+        screen_w = self.veil.winfo_screenwidth()
+
+        # Keep self.root pointed at the veil for backward compatibility with callers
+        # that read/assign warning_popup.root.
+        self.root = self.veil
+
+        # ---- Window 2: corner PANEL (fully opaque, full brightness, not dimmed). ----
         popup_w, popup_h = 540, 320
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
         x = screen_w - popup_w - 30
         y = 30
 
-        popup_frame = ctk.CTkFrame(self.root, width=popup_w, height=popup_h,
+        self.panel = ctk.CTkToplevel()
+        self.panel.overrideredirect(True)
+        self.panel.attributes("-topmost", True)
+        self.panel.attributes("-alpha", 1.0)
+        self.panel.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
+        self.panel.configure(bg="#0f172a")
+        self.panel.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.panel.bind("<Escape>", lambda e: "break")
+        self.panel.focus_force()
+
+        popup_frame = ctk.CTkFrame(self.panel, width=popup_w, height=popup_h,
                                    corner_radius=18, fg_color="#0f172a", border_color="#64748b", border_width=3)
-        popup_frame.place(x=x, y=y)
+        popup_frame.pack(fill="both", expand=True)
 
         # Raccoon visual (drawn programmatically)
         raccoon_img = self._create_raccoon_image(110, 110)
@@ -285,32 +534,38 @@ class WarningPopup:
                                         command=self._close_popup, state="disabled")
         self.close_btn.place(x=340, y=260)
 
-        # Lockout timer
+        # Keep the panel above the veil.
+        self.panel.lift()
+
+        # Lockout timer (driven by the panel's event loop).
         self.countdown = 5
         self._run_countdown()
 
-        # Block Alt-F4 somewhat by focusing
-        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
-        self.root.bind("<Escape>", lambda e: None)
-        self.root.bind("<Button-1>", lambda e: None)  # click dim ignore
-
-        # Make sure other windows can be seen through but darkened
-        self.root.after(100, self.root.attributes, "-alpha", 0.98)
-
     def _run_countdown(self):
+        if not (self.panel and self.panel.winfo_exists()):
+            return
         if self.countdown > 0:
             self.timer_label.configure(text=f"Reading required: {self.countdown}s")
             self.countdown -= 1
-            self.root.after(1000, self._run_countdown)
+            self.panel.after(1000, self._run_countdown)
         else:
             self.can_close = True
             self.timer_label.configure(text="Thank you — you may close now")
             self.close_btn.configure(state="normal", fg_color="#166534", text_color="white")
 
     def _close_popup(self):
-        if self.can_close and self.root:
-            self.root.destroy()
-            self.root = None
+        if not self.can_close:
+            return
+        # Destroy both the panel and the dim veil.
+        for win_attr in ("panel", "veil"):
+            win = getattr(self, win_attr, None)
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            setattr(self, win_attr, None)
+        self.root = None
 
     def _create_raccoon_image(self, w: int, h: int) -> Image.Image:
         """Procedurally create a cute cartoon raccoon + magnifying glass"""
@@ -360,9 +615,7 @@ class WarningPopup:
 class TrashPandaPatrolApp:
     def __init__(self):
         self.config = ConfigManager()
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            print("WARNING: No GEMINI_API_KEY environment variable set. Detection will be disabled. Set it to enable monitoring.")
+        api_key = os.environ.get("OPEN_ROUTER_API_KEY")
         self.detector = SafetyDetector(api_key)
         self.monitor_thread = None
         self.stop_event = threading.Event()
@@ -370,6 +623,7 @@ class TrashPandaPatrolApp:
         self.settings_window = None
         self.warning_popup = WarningPopup(self)
         self.monitor_active = self.config.get("screen_monitoring_enabled")
+        self._prev_frame_thumb = None  # last frame thumbnail, for cheap frame-diff skip
 
     # ---- UI: Settings Window ----
     def open_settings(self, require_auth=True):
@@ -401,7 +655,7 @@ class TrashPandaPatrolApp:
         phone_entry.pack(padx=12, pady=4)
         phone_entry.bind("<FocusOut>", lambda e: self._autosave_phone())
 
-        # Note: Gemini API key is now provided only via the GEMINI_API_KEY environment variable (never stored in the app config).
+        # Note: the OpenRouter API key is provided only via the OPEN_ROUTER_API_KEY environment variable (never stored in the app config).
 
         # Master Monitoring
         master_frame = ctk.CTkFrame(self.settings_window)
@@ -553,6 +807,7 @@ class TrashPandaPatrolApp:
     def start_monitor(self):
         if self.monitor_thread and self.monitor_thread.is_alive():
             return
+        self._prev_frame_thumb = None  # force a fresh analysis on (re)start
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
@@ -573,6 +828,7 @@ class TrashPandaPatrolApp:
 
     def _monitor_loop(self):
         interval = self.config.get("monitor_interval_seconds", 35)
+        idle_cycles = 0  # consecutive skipped scans -> used to back off the interval
         while not self.stop_event.is_set():
             if not self.config.get("screen_monitoring_enabled"):
                 time.sleep(2)
@@ -585,44 +841,114 @@ class TrashPandaPatrolApp:
                     time.sleep(min(3, interval))
                     continue
 
+                # --- (2) Frame-diff skip: don't pay for an unchanged screen ---
+                curr_thumb = frame_thumbnail_bytes(img)
+                if frames_are_similar(self._prev_frame_thumb, curr_thumb):
+                    self._prev_frame_thumb = curr_thumb
+                    idle_cycles += 1
+                    # Adaptive back-off: sleep longer (up to 2x) while the screen is static.
+                    backoff = min(interval * 2, interval + idle_cycles * 5)
+                    logger.info("[TrashPandaPatrol] Frame unchanged; skipping LLM (sleep %ss).", backoff)
+                    time.sleep(backoff)
+                    continue
+                self._prev_frame_thumb = curr_thumb
+                idle_cycles = 0
+
+                # NOTE: OCR pre-filter intentionally removed. We do not ship Tesseract,
+                # so it only ever skipped every scan (empty OCR text => always below the
+                # threshold). The frame-diff check above already avoids paying for an
+                # unchanged screen, which is enough cost control for our use.
+
                 result = self.detector.analyze_screenshot(img, enabled)
                 if result.get("suspicious"):
                     cat = result.get("category")
-                    if cat and self.config.get("enabled_categories").get(cat, False):
+                    # Robust category match: exact or substring (in case model returns shortened version)
+                    matched_cat = None
+                    if cat:
+                        cl = str(cat).strip().lower()
+                        for real_c, is_on in self.config.get("enabled_categories", {}).items():
+                            if is_on:
+                                rl = real_c.lower()
+                                if cl == rl or cl in rl or rl in cl:
+                                    matched_cat = real_c
+                                    break
+                    if matched_cat:
                         warning_msg = result.get("warning_message") or "Be careful online — you are not alone!"
-                        # Save screenshot for future review
-                        saved_path = save_screenshot(img, tag=cat[:15].replace(" ", "-"))
-                        print(f"[TrashPandaPatrol] TRIGGERED by {cat} | saved {saved_path}")
-                        # Show warning immediately
+                        saved_path = save_screenshot(img, tag=matched_cat[:15].replace(" ", "-"))
+                        print(f"[TrashPandaPatrol] TRIGGERED by {matched_cat} | saved {saved_path}")
                         self._show_warning_in_thread(warning_msg)
-                        # Notify SMS?
                         if self.config.get("phone_notifications_enabled") and self.config.get("phone_number"):
-                            self._send_sms_alert(warning_msg, cat, saved_path)
+                            self._send_sms_alert(warning_msg, matched_cat, saved_path)
+                    else:
+                        print(f"[TrashPandaPatrol] Suspicious but category '{cat}' not in enabled or not matched.")
                 else:
-                    pass  # nothing
+                    reason = result.get("reason", "")
+                    if reason:
+                        print("[TrashPandaPatrol] Clean scan. Reason:", reason[:150])
             except Exception as ex:
                 print("Monitor loop err:", ex)
 
             time.sleep(interval)
 
     def _show_warning_in_thread(self, message):
-        # Prefer a persistent hidden main root so popup shows reliable.
+        # Prefer a persistent hidden main root so the popup shows reliably.
+        # show() creates its own veil + panel Toplevels owned by whichever
+        # tk event loop is running, so we only need to schedule it.
         def schedule_show():
-            if hasattr(self, "hidden_root") and self.hidden_root:
-                self.warning_popup.root = self.hidden_root
-                self.warning_popup.show(message)
-            else:
-                # fallback standalone popup host
-                temp = ctk.CTk()
-                temp.withdraw()
-                self.warning_popup.root = temp
-                self.warning_popup.show(message)
-                temp.mainloop()
+            self.warning_popup.show(message)
 
         if hasattr(self, "hidden_root") and self.hidden_root:
             self.hidden_root.after(30, schedule_show)
         else:
-            threading.Thread(target=schedule_show, daemon=True).start()
+            # Fallback standalone host with its own event loop.
+            def run_standalone():
+                temp = ctk.CTk()
+                temp.withdraw()
+                self.warning_popup.show(message)
+                temp.mainloop()
+            threading.Thread(target=run_standalone, daemon=True).start()
+
+    def upload_image_temp(self, img_path: str) -> str:
+        """
+        Upload a screenshot to a free anonymous temp host so it can be attached to an MMS
+        (Twilio needs a public media_url; it cannot read a local file path).
+        Returns a public URL string, or None on any failure (caller falls back to text SMS).
+        The hosted file is temporary and used only for delivering the alert image.
+        """
+        if not requests or not img_path or not os.path.exists(img_path):
+            return None
+        # Try tmpfiles.org first, then 0x0.st as a fallback.
+        try:
+            with open(img_path, "rb") as f:
+                resp = requests.post(
+                    "https://tmpfiles.org/api/v1/upload",
+                    files={"file": (os.path.basename(img_path), f, "image/png")},
+                    timeout=20,
+                )
+            if resp.ok:
+                data = resp.json()
+                page_url = data.get("data", {}).get("url", "")
+                if page_url:
+                    # Convert viewer URL -> direct download URL for MMS media.
+                    # https://tmpfiles.org/12345/x.png -> https://tmpfiles.org/dl/12345/x.png
+                    return page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
+        except Exception as e:
+            print("[TrashPandaPatrol] tmpfiles upload failed:", e)
+        try:
+            with open(img_path, "rb") as f:
+                resp = requests.post(
+                    "https://0x0.st",
+                    files={"file": (os.path.basename(img_path), f, "image/png")},
+                    headers={"User-Agent": "TrashPandaPatrol/1.0"},
+                    timeout=20,
+                )
+            if resp.ok:
+                url = resp.text.strip()
+                if url.startswith("http"):
+                    return url
+        except Exception as e:
+            print("[TrashPandaPatrol] 0x0.st upload failed:", e)
+        return None
 
     def _send_sms_alert(self, warning_text: str, category: str, img_path: str):
         phone = self.config.get("phone_number")
@@ -637,14 +963,37 @@ class TrashPandaPatrolApp:
             return
         try:
             client = TwilioClient(sid, token)
-            body = f"🗑️ TRASHPANDAPATROL ALERT (Child Device)\nCategory: {category}\nWarning shown: {warning_text}\n\nCheck child's recent activity. Screenshots saved locally on device."
-            msg = client.messages.create(body=body, from_=from_phone, to=phone)
-            print("[TrashPandaPatrol] SMS sent:", msg.sid)
-            # Note: Full MMS image can be added using a publicly hosted URL of img. We skip here to stay simple & local.
+            body = f"🗑️ TRASHPANDAPATROL ALERT (Child Device)\nCategory: {category}\nWarning shown: {warning_text}\n\nCheck child's recent activity. A screenshot is attached if delivery supports MMS; it is also saved locally on the device."
+
+            # Attempt to attach the screenshot via a temporary public URL (MMS).
+            media_url = self.upload_image_temp(img_path)
+            kwargs = {"body": body, "from_": from_phone, "to": phone}
+            if media_url:
+                kwargs["media_url"] = [media_url]
+            else:
+                print("[TrashPandaPatrol] Screenshot upload unavailable; sending text-only SMS.")
+
+            msg = client.messages.create(**kwargs)
+            print(f"[TrashPandaPatrol] {'MMS' if media_url else 'SMS'} sent:", msg.sid)
         except Exception as e:
             print("SMS send fail:", e)
 
     # ---- Tray Icon ----
+    def _open_logs(self):
+        """Open the log file in the user's default text viewer (Notepad on Windows)."""
+        try:
+            if os.path.exists(LOG_FILE):
+                os.startfile(LOG_FILE)  # Windows: opens in default handler (Notepad)
+            else:
+                # No log yet; open the AppData folder so the parent can see where it will be.
+                os.startfile(APPDATA)
+        except Exception as e:
+            logger.warning("Could not open log file: %s", e)
+            try:
+                subprocess.Popen(["notepad.exe", LOG_FILE])
+            except Exception:
+                pass
+
     def _create_tray(self):
         icon_img = self._make_tray_icon_image()
 
@@ -664,6 +1013,7 @@ class TrashPandaPatrolApp:
             item("Open Settings", open_settings_from_tray),
             item("Toggle Monitoring", toggle_monitor, checked=lambda item: self.config.get("screen_monitoring_enabled")),
             item("Test Warning", lambda i: self._show_warning_in_thread("Never share personal info with anyone you do not know in real life!")),
+            item("View Logs", lambda i: self._open_logs()),
             pystray.Menu.SEPARATOR,
             item("Quit TrashPandaPatrol", self._quit_app)
         )
@@ -706,30 +1056,64 @@ class TrashPandaPatrolApp:
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        # Persistent hidden window to host dialogs/popups
-        self.hidden_root = ctk.CTk()
-        self.hidden_root.withdraw()
+        print("[TrashPandaPatrol] Starting...")
+        api_key_present = bool(os.environ.get("OPEN_ROUTER_API_KEY"))
+        print("[TrashPandaPatrol] OPEN_ROUTER_API_KEY present:", api_key_present)
+        if not api_key_present:
+            print("  (Detection disabled; monitoring will do nothing)")
 
-        # If first run - guide user through settings
-        if self.config.is_first_run():
-            self._authenticate()
-            # auto open
-            self.hidden_root.after(300, lambda: self.open_settings(require_auth=False))
+        # Persistent hidden window to host dialogs/popups will be created inside the dedicated UI thread
+        # (tkinter/ctk objects and mainloop must be owned by the same thread).
+        # pystray blocks on this (main) thread for reliable Windows tray icon + message pump.
 
-        # Start monitoring if enabled at launch
-        if self.config.get("screen_monitoring_enabled"):
-            self.start_monitor()
+        # Schedule UI in background thread (root creation + mainloop happen there).
+        def _run_ui():
+            self.hidden_root = ctk.CTk()
+            self.hidden_root.withdraw()
 
-        # Start tray in background thread so mainloop stays alive
+            # First-run dialogs + deferred UI can safely run here (same thread as root).
+            if self.config.is_first_run():
+                self._authenticate()
+                # auto open
+                self.hidden_root.after(300, lambda: self.open_settings(require_auth=False))
+            else:
+                print("[TrashPandaPatrol] Not first run - no window auto-opens.")
+
+            # Start monitoring if enabled at launch
+            if self.config.get("screen_monitoring_enabled"):
+                self.start_monitor()
+            else:
+                print("[TrashPandaPatrol] Screen monitoring is OFF in settings.")
+
+            try:
+                self.hidden_root.mainloop()
+            except Exception as ex:
+                print("UI loop error:", ex)
+
+        ui_thread = threading.Thread(target=_run_ui, daemon=True)
+        ui_thread.start()
+
+        # Create and run tray (blocking main thread)
         tray = self._create_tray()
-        threading.Thread(target=tray.run, daemon=True).start()
-
+        def _tray_setup(icon):
+            icon.visible = True
+            print("[TrashPandaPatrol] Tray icon registered. Check notification area (may need to expand ^).")
+            try:
+                icon.notify(
+                    "TrashPandaPatrol is active in the system tray.\nRight-click raccoon icon to open Settings (or toggle monitoring / quit).",
+                    "TrashPandaPatrol"
+                )
+            except Exception:
+                pass
+            print("[TrashPandaPatrol] Ready. Use tray menu for UI.")
         try:
-            self.hidden_root.mainloop()
+            tray.run(setup=_tray_setup)  # blocks until stop
         except KeyboardInterrupt:
             self._quit_app()
+        print("[TrashPandaPatrol] Exited.")
 
 
 if __name__ == "__main__":
+    setup_logging()
     app = TrashPandaPatrolApp()
     app.run()
