@@ -1,4 +1,6 @@
-# TrashPandaPatrol - Windows Child Cybersecurity Safety App
+<img src="./TrashPandaPatrol/assets/TrashPandaPatrol.png">
+
+# Windows Child Cybersecurity Safety App
 
 **Target audience:** Children 16 and younger.
 
