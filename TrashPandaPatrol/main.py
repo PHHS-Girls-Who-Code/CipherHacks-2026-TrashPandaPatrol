@@ -42,7 +42,6 @@ CONFIG_FILE = os.path.join(APPDATA, "settings.json")
 SCREENSHOTS_DIR = os.path.join(APPDATA, "screenshots")
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 LOG_FILE = os.path.join(APPDATA, "trashpanda.log")
-RACOON_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "raccoon.png")  # optional external
 
 # ------------- Cost / capture tuning -------------
 # Downscale the screenshot's long edge to this many pixels before sending to the LLM.
@@ -521,53 +520,109 @@ class WarningPopup:
         self.root = self.veil
 
         # ---- Window 2: corner PANEL (fully opaque, full brightness, not dimmed). ----
-        popup_w, popup_h = 540, 320
+        # Friendly, kid-facing "scene" card. The whole scene (sky, sun, raccoon,
+        # grass, duck, reassurance note + "I understand" area) is the bundled
+        # popup.png image; we overlay a speech bubble with the AI safety message
+        # and live functional controls on top of it.
+        BG_W, BG_H = 1246, 738          # native popup.png size
+        popup_w = 620
+        popup_h = round(popup_w * BG_H / BG_W)   # keep the image aspect ratio
         x = screen_w - popup_w - 30
         y = 30
+        sx = popup_w / BG_W              # x scale factor (source px -> panel px)
+        sy = popup_h / BG_H              # y scale factor
+
+        # Scene palette
+        UNDERSTAND = "#5b6b1f"   # olive "I understand" button
+        UNDERSTAND_HOVER = "#47551a"
+
+        # Color-key used to make the area outside the rounded card border show
+        # through (Windows per-color transparency). Magenta is never used by the
+        # scene art, so it is a safe key.
+        TRANSPARENT_KEY = "#ff00ff"
 
         self.panel = ctk.CTkToplevel()
         self.panel.overrideredirect(True)
         self.panel.attributes("-topmost", True)
         self.panel.attributes("-alpha", 1.0)
         self.panel.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
-        self.panel.configure(bg="#0f172a")
+        self.panel.configure(bg=TRANSPARENT_KEY)
+        # Pixels exactly this color become fully transparent on Windows, so the
+        # rounded-card corners (transparent in popup.png) drop out cleanly.
+        try:
+            self.panel.wm_attributes("-transparentcolor", TRANSPARENT_KEY)
+        except Exception:
+            pass
         self.panel.protocol("WM_DELETE_WINDOW", lambda: None)
         self.panel.bind("<Escape>", lambda e: "break")
         self.panel.focus_force()
 
         popup_frame = ctk.CTkFrame(self.panel, width=popup_w, height=popup_h,
-                                   corner_radius=18, fg_color="#0f172a", border_color="#64748b", border_width=3)
+                                   corner_radius=0, fg_color=TRANSPARENT_KEY, border_width=0)
         popup_frame.pack(fill="both", expand=True)
 
-        # Raccoon visual (drawn programmatically)
-        raccoon_img = self._create_raccoon_image(110, 110)
-        raccoon_label = ctk.CTkLabel(popup_frame, image=ctk.CTkImage(raccoon_img, size=(110, 110)), text="")
-        raccoon_label.place(x=20, y=20)
+        # Geometry for the countdown text (rendered into the scene image, not a
+        # separate label, so there are no stray background rectangles). The new
+        # popup.png leaves the lower-middle band empty, so the button and the
+        # countdown sit there, clear of the reassurance bubble and the duck.
+        self._timer_w = 170
+        self._timer_h = 30
+        self._btn_cx = 770 * sx          # "I understand" button center
+        self._btn_cy = 625 * sy
+        self._timer_cx = 360 * sx        # countdown text center (left of the button)
+        self._timer_cy = 625 * sy
 
-        # Title and message
-        title_lbl = ctk.CTkLabel(popup_frame, text="🦝 TrashPanda Alert", font=ctk.CTkFont(size=22, weight="bold"),
-                                 text_color="#f59e0b")
-        title_lbl.place(x=145, y=15)
+        # Build the static scene once: popup.png background + the AI-message
+        # speech bubble. The countdown text is composited on top per tick.
+        try:
+            base = self._load_popup_background(popup_w, popup_h).convert("RGBA")
+        except Exception:
+            base = Image.new("RGBA", (popup_w, popup_h), (127, 178, 238, 255))
 
-        msg_label = ctk.CTkLabel(popup_frame, text=message,
-                                 font=ctk.CTkFont(size=14), text_color="#f1f5f9",
-                                 wraplength=310, justify="left")
-        msg_label.place(x=145, y=55)
+        try:
+            bubble_img, bub_w, bub_h = self._create_speech_bubble(message, max_text_w=300)
+            # Center the bubble horizontally within the open sky area (to the
+            # right of the raccoon) instead of pinning it to the corner.
+            sky_left = 470 * sx            # right edge of the raccoon circle
+            sky_right = popup_w - 20
+            bub_x = int(sky_left + (sky_right - sky_left - bub_w) / 2)
+            bub_x = max(int(sky_left), min(bub_x, popup_w - bub_w - 16))
+            bub_y = 18
+            base.alpha_composite(bubble_img, (bub_x, bub_y))
+        except Exception:
+            pass
 
-        footer = ctk.CTkLabel(popup_frame, text="Take a deep breath and stay safe online.\nTell a trusted adult if anything makes you uncomfortable.",
-                              font=ctk.CTkFont(size=11), text_color="#64748b", justify="left")
-        footer.place(x=20, y=220)
+        self._scene_size = (popup_w, popup_h)
+        self._transparent_key = TRANSPARENT_KEY
+        # Pre-flatten the static scene ONCE onto the magenta key (corners keyed
+        # out by -transparentcolor). Per-tick countdown updates only paste the
+        # small timer text onto a copy of this, so we never re-threshold the
+        # whole image each second.
+        self._scene_flat = self._flatten_on_key(base)
+        # ONE label fills the whole panel -> no surrounding box artifact.
+        self.scene_label = ctk.CTkLabel(popup_frame,
+                                        image=ctk.CTkImage(self._scene_flat,
+                                                           size=(popup_w, popup_h)),
+                                        text="", fg_color=TRANSPARENT_KEY)
+        self.scene_label.place(x=0, y=0)
 
-        # Countdown timer + close disabled
-        self.timer_label = ctk.CTkLabel(popup_frame, text="Please read carefully (5s)", font=ctk.CTkFont(size=13),
-                                        text_color="#ef4444")
-        self.timer_label.place(x=145, y=265)
-
-        # Close button initially disabled
-        self.close_btn = ctk.CTkButton(popup_frame, text="I understand ✓", width=160,
-                                        fg_color="#334155", text_color="#e2e8f0",
+        # Functional "I understand" button in the empty lower-middle band.
+        # It sits inside a holder frame filled with the scene's sky color so the
+        # button's rounded corners blend into the scene instead of showing the
+        # magenta key (which the OS would render as black corners).
+        SCENE_FILL = "#90b1f9"           # popup.png interior color under the button
+        btn_w, btn_h = 160, 44
+        btn_holder = ctk.CTkFrame(popup_frame, width=btn_w, height=btn_h,
+                                  corner_radius=0, fg_color=SCENE_FILL, border_width=0)
+        btn_holder.place(x=self._btn_cx, y=self._btn_cy, anchor="center")
+        btn_holder.pack_propagate(False)
+        self.close_btn = ctk.CTkButton(btn_holder, text="I understand",
+                                        corner_radius=12, font=ctk.CTkFont(size=17, weight="bold"),
+                                        fg_color="#3f4a4a", text_color="#d9e07a", hover_color=UNDERSTAND_HOVER,
                                         command=self._close_popup, state="disabled")
-        self.close_btn.place(x=340, y=260)
+        self.close_btn.pack(fill="both", expand=True)
+        # Remember the enabled colors so the countdown can re-enable the button.
+        self._understand_color = UNDERSTAND
 
         # Keep the panel above the veil.
         self.panel.lift()
@@ -576,17 +631,65 @@ class WarningPopup:
         self.countdown = 5
         self._run_countdown()
 
+    def _set_timer_text(self, text: str):
+        """Paste the countdown text onto a copy of the pre-flattened scene (no
+        separate label), so the text floats over the scene with no background
+        rectangle and the static base is flattened only once."""
+        try:
+            frame = self._scene_flat.copy()      # already RGB, corners keyed
+            txt = self._render_timer_text(text)  # RGBA text on transparent bg
+            tx = int(self._timer_cx - self._timer_w / 2)
+            ty = int(self._timer_cy - self._timer_h / 2)
+            frame.paste(txt, (tx, ty), txt)      # alpha mask -> only text drawn
+            self.scene_label.configure(image=ctk.CTkImage(frame, size=self._scene_size))
+        except Exception:
+            pass
+
+    def _flatten_on_key(self, img: "Image.Image") -> "Image.Image":
+        """Flatten an RGBA scene onto the magenta transparency key.
+
+        The card's transparent corners become the exact key color so Windows'
+        -transparentcolor drops them out. The rounded border's anti-aliased
+        pixels are hard-thresholded (alpha >= 128 -> kept opaque) so no faint
+        magenta halo is left around the rounded edge.
+        """
+        key = getattr(self, "_transparent_key", "#ff00ff")
+        kr, kg, kb = (int(key[i:i + 2], 16) for i in (1, 3, 5))
+        bg = Image.new("RGB", img.size, (kr, kg, kb))
+        # Hard-edge mask: only sufficiently-opaque pixels are painted; everything
+        # else stays key-colored (and therefore transparent on screen).
+        mask = img.getchannel("A").point(lambda a: 255 if a >= 128 else 0)
+        bg.paste(img.convert("RGB"), (0, 0), mask)
+        return bg
+
+    def _render_timer_text(self, text: str) -> Image.Image:
+        img = Image.new("RGBA", (self._timer_w, self._timer_h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 15)
+        except Exception:
+            font = ImageFont.load_default()
+        tw = int(d.textlength(text, font=font))
+        ascent, descent = font.getmetrics()
+        tx = (self._timer_w - tw) / 2
+        ty = (self._timer_h - (ascent + descent)) / 2
+        d.text((tx, ty), text, font=font, fill="#1f2937")
+        return img
+
     def _run_countdown(self):
         if not (self.panel and self.panel.winfo_exists()):
             return
         if self.countdown > 0:
-            self.timer_label.configure(text=f"Reading required: {self.countdown}s")
+            unit = "second" if self.countdown == 1 else "seconds"
+            self._set_timer_text(f"{self.countdown} {unit} left")
             self.countdown -= 1
             self.panel.after(1000, self._run_countdown)
         else:
             self.can_close = True
-            self.timer_label.configure(text="Thank you — you may close now")
-            self.close_btn.configure(state="normal", fg_color="#166534", text_color="white")
+            self._set_timer_text("You may close now")
+            self.close_btn.configure(state="normal",
+                                     fg_color=getattr(self, "_understand_color", "#5b6b1f"),
+                                     text_color="#f4f7c2")
 
     def _focus_panel(self):
         """Bring the alert panel back above the veil and give it focus.
@@ -621,48 +724,82 @@ class WarningPopup:
         self.root = None
         self._active = False
 
-    def _create_raccoon_image(self, w: int, h: int) -> Image.Image:
-        """Procedurally create a cute cartoon raccoon + magnifying glass"""
+    def _load_popup_background(self, w: int, h: int) -> Image.Image:
+        """Return the bundled popup scene (assets/popup.png) scaled to (w, h)."""
+        path = os.path.join(os.path.dirname(__file__), "assets", "popup.png")
+        img = Image.open(path).convert("RGBA")
+        return img.resize((w, h), Image.LANCZOS)
+
+    def _create_speech_bubble(self, message: str, max_text_w: int = 300):
+        """Build a white speech bubble sized to fit ``message``.
+
+        The text is drawn directly onto the image (no separate transparent
+        label over it), which avoids the bg-color artifact behind the text and
+        lets the bubble shrink to the content. Returns (image, width, height).
+        """
+        pad_x, pad_y = 22, 18      # inner padding around the text
+        tail_h = 18                # height reserved below the body for the tail
+        line_gap = 6
+
+        # Pick a bold TrueType font; fall back to PIL's default if unavailable.
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 17)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Measure helper.
+        measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+
+        def text_w(s: str) -> int:
+            return int(measure.textlength(s, font=font))
+
+        # Word-wrap the message to fit within max_text_w.
+        lines = []
+        for paragraph in (message or "").split("\n"):
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            cur = words[0]
+            for word in words[1:]:
+                if text_w(cur + " " + word) <= max_text_w:
+                    cur += " " + word
+                else:
+                    lines.append(cur)
+                    cur = word
+            lines.append(cur)
+        if not lines:
+            lines = [""]
+
+        # Line height from the font metrics.
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent
+
+        content_w = max((text_w(ln) for ln in lines), default=0)
+        body_w = content_w + pad_x * 2
+        body_h = line_h * len(lines) + max(0, len(lines) - 1) * line_gap + pad_y * 2
+        w = body_w
+        h = body_h + tail_h
+
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
+        # Rounded white body.
+        try:
+            d.rounded_rectangle([0, 0, w - 1, body_h], radius=18, fill="#ffffff")
+        except AttributeError:
+            d.rectangle([0, 0, w - 1, body_h], fill="#ffffff")
+        # Tail pointing down-left toward the raccoon.
+        tail_x = min(46, w - 30)
+        d.polygon([(tail_x, body_h - 2), (tail_x + 34, body_h - 2), (tail_x - 18, h - 1)],
+                  fill="#ffffff")
 
-        # Body/head
-        d.ellipse([10, 35, 75, 100], fill="#4b5563")  # dark gray
-        d.ellipse([22, 18, 68, 65], fill="#6b7280")    # head
-
-        # Ears
-        d.polygon([(23, 28), (14, 5), (35, 19)], fill="#374151")
-        d.polygon([(60, 19), (58, 7), (72, 25)], fill="#374151")
-        d.ellipse([23, 12, 33, 23], fill="#9ca3af")
-        d.ellipse([50, 12, 60, 23], fill="#9ca3af")
-
-        # Eye mask
-        d.ellipse([26, 35, 45, 53], fill="#111827")
-        d.ellipse([47, 34, 66, 53], fill="#111827")
-        # Eyes
-        d.ellipse([30, 41, 38, 50], fill="#f1f5f9")
-        d.ellipse([53, 41, 61, 50], fill="#f1f5f9")
-        d.ellipse([33, 44, 36, 48], fill="#111827")
-        d.ellipse([56, 44, 59, 48], fill="#111827")
-
-        # Nose & snout highlight
-        d.ellipse([41, 51, 51, 60], fill="#1f2937")
-        # smile
-        d.arc([38, 55, 54, 65], start=10, end=170, fill="#0f172a", width=1)
-
-        # Simplistic body stripes etc
-        d.line([(28, 65), (28, 92)], fill="#374151", width=2)
-        d.line([(48, 65), (48, 92)], fill="#374151", width=2)
-
-        # Arm with magnifying glass
-        d.rectangle([62, 55, 100, 72], fill="#4b5563")
-        # Glass
-        d.ellipse([78, 47, 110, 79], outline="#64748b", width=6)
-        d.ellipse([84, 55, 104, 71], outline="#cbd5e1", width=1)
-
-        # Handle
-        d.line([(106, 75), (120, 95)], fill="#4b5563", width=5)
-        return img
+        # Draw the centered text.
+        ty = pad_y
+        for ln in lines:
+            tx = (w - text_w(ln)) / 2
+            d.text((tx, ty), ln, font=font, fill="#1f2937")
+            ty += line_h + line_gap
+        return img, w, h
 
 
 # ------------- Main Application -------------
@@ -775,7 +912,7 @@ class TrashPandaPatrolApp:
         # ---- SMS / automated notifications ----
         notif_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
         notif_frame.pack(padx=20, pady=6, fill="x")
-        self.notif_switch = ctk.CTkSwitch(notif_frame, text="Send Automated SMS warnings to parent phone",
+        self.notif_switch = ctk.CTkSwitch(notif_frame, text="Send Automated Email warning to parent",
                                            command=self._toggle_notifications,
                                            progress_color=ACCENT_BLUE, text_color=TEXT,
                                            font=ctk.CTkFont(size=15, weight="bold"))
