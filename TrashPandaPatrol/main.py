@@ -688,92 +688,140 @@ class TrashPandaPatrolApp:
         if require_auth and not self._authenticate():
             return
 
+        # ---- Color palette (matches the dark "card" mockup) ----
+        BG = "#3a3a3a"          # window background
+        CARD = "#2b2b2b"        # inner section cards
+        ENTRY = "#5a5a5a"       # entry field fill
+        TEXT = "#f1f1f1"        # primary text
+        MUTED = "#a3a3a3"       # secondary text
+        ACCENT_BLUE = "#3b82f6" # switches / blue button
+        ORANGE = "#e07b39"      # test button
+
         self.settings_window = ctk.CTkToplevel()
         self.settings_window.title("TrashPandaPatrol • Parent Settings")
-        self.settings_window.geometry("680x720")
+        self.settings_window.geometry("620x960")
         self.settings_window.resizable(False, False)
+        self.settings_window.configure(fg_color=BG)
 
-        # Password section
-        pass_frame = ctk.CTkFrame(self.settings_window, corner_radius=12)
-        pass_frame.pack(padx=20, pady=(20, 10), fill="x")
+        # ---- Header: logo (raccoon + wordmark) ----
+        header = ctk.CTkFrame(self.settings_window, fg_color="transparent")
+        header.pack(padx=20, pady=(18, 6), fill="x")
+        logo_path = os.path.join(os.path.dirname(__file__), "assets", "TrashPandaPatrol.png")
+        try:
+            logo_img = Image.open(logo_path)
+            logo_w = 360
+            logo_h = int(logo_img.height * (logo_w / logo_img.width))
+            ctk.CTkLabel(header, text="", image=ctk.CTkImage(logo_img, size=(logo_w, logo_h))).pack()
+        except Exception:
+            ctk.CTkLabel(header, text="TRASH PANDA PATROL",
+                         font=ctk.CTkFont(size=26, weight="bold"), text_color=ACCENT_BLUE).pack()
 
-        ctk.CTkLabel(pass_frame, text="🔐 Access Protected • Changes auto-saved", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=8)
-
-        # Parent Email (where alerts are delivered)
-        contact_frame = ctk.CTkFrame(self.settings_window)
+        # ---- Parent Email (RECEIVER) ----
+        contact_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
         contact_frame.pack(padx=20, pady=6, fill="x")
-
-        ctk.CTkLabel(contact_frame, text="Parent Email (RECEIVER) — any email that should receive the alerts. No password needed. Leave blank to disable email alerts.", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+        contact_row = ctk.CTkFrame(contact_frame, fg_color="transparent")
+        contact_row.pack(fill="x", padx=14, pady=12)
+        ctk.CTkLabel(contact_row, text="Parent Email (RECEIVER)", anchor="w",
+                     font=ctk.CTkFont(size=15, weight="bold"), text_color=TEXT).pack(side="left")
         self.parent_email_var = tk.StringVar(value=self.config.get("parent_email", ""))
-        email_entry = ctk.CTkEntry(contact_frame, textvariable=self.parent_email_var, placeholder_text="parent@example.com", width=340)
-        email_entry.pack(padx=12, pady=4)
+        email_entry = ctk.CTkEntry(contact_row, textvariable=self.parent_email_var,
+                                   placeholder_text="parent@example.com", width=300,
+                                   fg_color=ENTRY, border_width=0, corner_radius=16)
+        email_entry.pack(side="right")
         email_entry.bind("<FocusOut>", lambda e: self._autosave_parent_email())
 
         # Note: the OpenRouter API key is provided only via the OPEN_ROUTER_API_KEY environment variable (never stored in the app config).
 
-        # Master Monitoring
-        master_frame = ctk.CTkFrame(self.settings_window)
-        master_frame.pack(padx=20, pady=10, fill="x")
-
-        self.master_switch = ctk.CTkSwitch(master_frame, text="✅ ENABLE SCREEN MONITORING for online safety & warnings",
-                                            command=self._toggle_master)
-        self.master_switch.pack(pady=8, padx=10, anchor="w")
+        # ---- Master Monitoring (compact toggle) ----
+        master_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
+        master_frame.pack(padx=20, pady=6, fill="x")
+        self.master_switch = ctk.CTkSwitch(master_frame, text="Enable Screen Monitoring",
+                                            command=self._toggle_master,
+                                            progress_color=ACCENT_BLUE, text_color=TEXT,
+                                            font=ctk.CTkFont(size=15, weight="bold"))
+        self.master_switch.pack(pady=14, padx=18, anchor="w")
         self.master_switch.select() if self.config.get("screen_monitoring_enabled") else self.master_switch.deselect()
 
-        # Sub toggles section
-        self.toggle_frame = ctk.CTkFrame(self.settings_window)
-        self.toggle_frame.pack(padx=20, pady=2, fill="both")
+        # ---- Warning Categories ----
+        self.toggle_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
+        self.toggle_frame.pack(padx=20, pady=6, fill="x")
 
-        ctk.CTkLabel(self.toggle_frame, text="Warning Categories (only fires if Screen Monitoring enabled):",
-                    font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=8)
+        ctk.CTkLabel(self.toggle_frame, text="Warning Catagories",
+                     font=ctk.CTkFont(size=18, weight="bold"), text_color=TEXT).pack(anchor="w", padx=18, pady=(14, 6))
+
+        # Short, friendly labels for display (config keys stay the canonical CATEGORIES)
+        cat_display = {
+            "Hate Speech & Harassment": "Hate Speech & Harrassment",
+            "Violence & Gore": "Violence & Gore",
+            "Sexual Content (NSFW)": "Sexual Content",
+            "Illegal Acts & Drugs": "Illegal Acts",
+            "Self-Harm": "Self-Harm",
+            "Personal Data Requests (Phishing / Social Engineering)": "Personal Data Requests (Phishing)",
+        }
 
         self.cat_vars = {}
-        for i, cat in enumerate(CATEGORIES):
+        self.cat_switches = {}
+        for cat in CATEGORIES:
             var = tk.BooleanVar(value=self.config.get("enabled_categories", {}).get(cat, True))
-            sw = ctk.CTkSwitch(self.toggle_frame, text=cat, variable=var,
-                               command=lambda c=cat, v=var: self._toggle_category(c, v))
-            sw.pack(anchor="w", padx=14, pady=3)
+            sw = ctk.CTkSwitch(self.toggle_frame, text=cat_display.get(cat, cat), variable=var,
+                               command=lambda c=cat, v=var: self._toggle_category(c, v),
+                               progress_color=ACCENT_BLUE, text_color=TEXT,
+                               font=ctk.CTkFont(size=15, weight="bold"))
+            sw.pack(anchor="w", padx=22, pady=6)
             self.cat_vars[cat] = var
+            self.cat_switches[cat] = sw
+        ctk.CTkLabel(self.toggle_frame, text="").pack(pady=2)
 
-        # Email Notifications
-        notif_frame = ctk.CTkFrame(self.settings_window)
-        notif_frame.pack(padx=20, pady=10, fill="x")
-        self.notif_switch = ctk.CTkSwitch(notif_frame, text="📧 Email automated warnings to the parent email (with screenshot)",
-                                           command=self._toggle_notifications)
-        self.notif_switch.pack(pady=6, padx=10, anchor="w")
+        # ---- SMS / automated notifications ----
+        notif_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
+        notif_frame.pack(padx=20, pady=6, fill="x")
+        self.notif_switch = ctk.CTkSwitch(notif_frame, text="Send Automated SMS warnings to parent phone",
+                                           command=self._toggle_notifications,
+                                           progress_color=ACCENT_BLUE, text_color=TEXT,
+                                           font=ctk.CTkFont(size=15, weight="bold"))
+        self.notif_switch.pack(pady=14, padx=18, anchor="w")
         if self.config.get("phone_notifications_enabled"):
             self.notif_switch.select()
 
-        # Gmail sender (free email via Gmail SMTP)
-        gmail_frame = ctk.CTkFrame(self.settings_window)
-        gmail_frame.pack(padx=20, pady=(0,10), fill="x")
-        ctk.CTkLabel(gmail_frame, text="Email Sender (SENDER) — the Gmail account used to send alerts. Can be different from the receiver above.",
-                     anchor="w", font=ctk.CTkFont(size=12)).pack(padx=10, pady=4)
+        # ---- Email Sender (SENDER) ----
+        gmail_frame = ctk.CTkFrame(self.settings_window, fg_color=CARD, corner_radius=14)
+        gmail_frame.pack(padx=20, pady=6, fill="x")
+        ctk.CTkLabel(gmail_frame, text="Email Sender (SENDER) – Gmail account used to send alerts.",
+                     anchor="w", font=ctk.CTkFont(size=15, weight="bold"), text_color=TEXT).pack(anchor="w", padx=18, pady=(14, 2))
         ctk.CTkLabel(gmail_frame, text="Make an App Password at myaccount.google.com/apppasswords (2-Step Verification must be on).",
-                     anchor="w", font=ctk.CTkFont(size=10), text_color="#64748b").pack(padx=10, pady=(0, 4))
+                     anchor="w", font=ctk.CTkFont(size=11), text_color=MUTED).pack(anchor="w", padx=18, pady=(0, 6))
         self.gmail_addr_var = tk.StringVar(value=self.config.get("gmail_address", ""))
         self.gmail_pw_var = tk.StringVar(value=self.config.get("gmail_app_password", ""))
         for lbl, svar in [("Gmail Address", self.gmail_addr_var), ("App Password", self.gmail_pw_var)]:
-            rowf = ctk.CTkFrame(gmail_frame)
-            rowf.pack(fill="x", padx=8)
-            ctk.CTkLabel(rowf, text=lbl, width=130).pack(side="left", pady=3)
-            ent = ctk.CTkEntry(rowf, textvariable=svar, width=420, show="•" if "password" in lbl.lower() else "")
-            ent.pack(side="left", pady=2, padx=4)
+            rowf = ctk.CTkFrame(gmail_frame, fg_color="transparent")
+            rowf.pack(fill="x", padx=18, pady=4)
+            ctk.CTkLabel(rowf, text=lbl, width=140, anchor="w",
+                         font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT).pack(side="left")
+            ent = ctk.CTkEntry(rowf, textvariable=svar, width=300,
+                               fg_color=ENTRY, border_width=0, corner_radius=16,
+                               show="•" if "password" in lbl.lower() else "")
+            ent.pack(side="left", padx=6)
             ent.bind("<FocusOut>", lambda e: self._autosave_gmail())
+        ctk.CTkLabel(gmail_frame, text="").pack(pady=2)
 
-        # Bottom controls
+        # ---- Bottom controls ----
         action_frame = ctk.CTkFrame(self.settings_window, fg_color="transparent")
-        action_frame.pack(fill="x", pady=18, padx=20)
+        action_frame.pack(fill="x", pady=(10, 18), padx=20)
 
-        pwd_btn = ctk.CTkButton(action_frame, text="Change Parent Password", fg_color="#334155",
+        pwd_btn = ctk.CTkButton(action_frame, text="Change Parent Password",
+                                fg_color=ACCENT_BLUE, hover_color="#2563eb", corner_radius=14,
+                                font=ctk.CTkFont(size=14, weight="bold"),
                                 command=self._change_password_dialog)
-        pwd_btn.pack(side="left", padx=6)
+        pwd_btn.pack(side="left", padx=(0, 8))
 
-        test_btn = ctk.CTkButton(action_frame, text="Test Warning Popup", fg_color="#854d0e",
+        test_btn = ctk.CTkButton(action_frame, text="Test Warning",
+                                 fg_color=ORANGE, hover_color="#c2671f", corner_radius=14,
+                                 font=ctk.CTkFont(size=14, weight="bold"),
                                  command=lambda: self._trigger_warning_manual())
-        test_btn.pack(side="left", padx=6)
+        test_btn.pack(side="left", padx=4)
 
-        save_info = ctk.CTkLabel(action_frame, text="All settings are auto-saved instantly.", text_color="#64748b", font=ctk.CTkFont(size=11))
+        save_info = ctk.CTkLabel(action_frame, text="All settings are auto-saved instantly",
+                                 text_color=MUTED, font=ctk.CTkFont(size=12))
         save_info.pack(side="right")
 
         self._refresh_disabled_state()
@@ -808,17 +856,9 @@ class TrashPandaPatrolApp:
     def _refresh_disabled_state(self):
         in_master = self.master_switch.get()
         state = "normal" if in_master else "disabled"
-        color = None if in_master else "#475569"
-        for sw, var in [(self.notif_switch, None)]:
-            # The sub switches
-            pass
-        # Disable/enable all cat_vars
-        for cat, var in self.cat_vars.items():
-            # Widgets we stored? We can just reactive change bindings
-            # Instead toggle visually
-            for child in self.toggle_frame.winfo_children():
-                if isinstance(child, ctk.CTkSwitch) and cat in str(child.cget("text")):
-                    child.configure(state=state)
+        # Enable/disable all category switches
+        for sw in getattr(self, "cat_switches", {}).values():
+            sw.configure(state=state)
         # Phone toggle
         self.notif_switch.configure(state=state)
 
