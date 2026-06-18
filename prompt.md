@@ -23,3 +23,5 @@ Illegal Acts & Drugs: Terms related to purchasing or manufacturing illicit drugs
 We are young dumb broke highschool kids
 We are doing a hackathon
 We are not actually storing data because we have no users!
+
+Don't raise a warning popup for the same suspicious message more than once because we do not want to bog down the child user's screen after already giving them a warning

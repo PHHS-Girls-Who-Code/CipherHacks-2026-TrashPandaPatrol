@@ -447,9 +447,17 @@ class WarningPopup:
         self.panel = None
         self.can_close = False
         self.dim_alpha = 0.65
+        self.seen_messages: set = set()
+        # Single-instance guard. Set the instant we begin building a popup and
+        # cleared only when it is fully torn down. This is checked BEFORE any
+        # window is created, so a second scan can never stack a second veil
+        # even if it fires before the first popup's windows are realized.
+        self._active = False
 
     def is_open(self) -> bool:
-        """True if a warning popup (veil or panel) is currently displayed."""
+        """True if a warning popup is currently displayed (or being built)."""
+        if self._active:
+            return True
         for win in (self.panel, self.veil):
             try:
                 if win is not None and win.winfo_exists():
@@ -459,13 +467,33 @@ class WarningPopup:
         return False
 
     def show(self, message: str):
-        # If a popup is already on screen, do not stack another one on top.
+        key = (message or "").strip().lower()
+        if key and key in self.seen_messages:
+            logger.info("[TrashPandaPatrol] Duplicate suspicious message; skipping popup.")
+            return
+        # If a popup is already on screen (or mid-build), do not stack another
+        # one on top. This is what prevents the "second black overlay" that can
+        # never be dismissed.
         if self.is_open():
             logger.info("[TrashPandaPatrol] Warning already open; not opening another popup.")
             return
+        # Claim the single-instance slot immediately, before creating any window.
+        self._active = True
+        if key:
+            self.seen_messages.add(key)
 
         self.can_close = False
 
+        try:
+            self._build_windows(message)
+        except Exception as e:
+            # If anything fails while building the popup, tear down whatever was
+            # created and release the single-instance slot so future warnings
+            # can still appear (otherwise a half-built popup would block forever).
+            logger.warning("[TrashPandaPatrol] Failed to show warning popup: %s", e)
+            self._teardown_windows()
+
+    def _build_windows(self, message: str):
         # ---- Window 1: fullscreen DIM VEIL (semi-transparent so the real screen
         # stays visible-but-darkened behind it, "to give focus" to the warning). ----
         self.veil = ctk.CTkToplevel()
@@ -477,7 +505,11 @@ class WarningPopup:
         self.veil.attributes("-alpha", self.dim_alpha)
         self.veil.protocol("WM_DELETE_WINDOW", lambda: None)
         self.veil.bind("<Escape>", lambda e: "break")
-        self.veil.bind("<Button-1>", lambda e: "break")
+        # Clicking the dimmed veil must NOT do anything destructive. Instead,
+        # bring the panel back to the front and give it focus so the child is
+        # guided back to the "I understand" button (this also fixes the case
+        # where clicking the veil stole focus from the panel).
+        self.veil.bind("<Button-1>", lambda e: self._focus_panel())
 
         screen_w = self.veil.winfo_screenwidth()
 
@@ -553,10 +585,28 @@ class WarningPopup:
             self.timer_label.configure(text="Thank you — you may close now")
             self.close_btn.configure(state="normal", fg_color="#166534", text_color="white")
 
+    def _focus_panel(self):
+        """Bring the alert panel back above the veil and give it focus.
+
+        Called when the child clicks the dimmed veil instead of the panel, so
+        focus is never lost and they are guided back to the close button.
+        """
+        try:
+            if self.panel is not None and self.panel.winfo_exists():
+                self.panel.lift()
+                self.panel.attributes("-topmost", True)
+                self.panel.focus_force()
+        except Exception:
+            pass
+        return "break"
+
     def _close_popup(self):
         if not self.can_close:
             return
-        # Destroy both the panel and the dim veil.
+        self._teardown_windows()
+
+    def _teardown_windows(self):
+        """Destroy the panel + veil and release the single-instance slot."""
         for win_attr in ("panel", "veil"):
             win = getattr(self, win_attr, None)
             if win is not None:
@@ -566,6 +616,7 @@ class WarningPopup:
                     pass
             setattr(self, win_attr, None)
         self.root = None
+        self._active = False
 
     def _create_raccoon_image(self, w: int, h: int) -> Image.Image:
         """Procedurally create a cute cartoon raccoon + magnifying glass"""
@@ -894,19 +945,20 @@ class TrashPandaPatrolApp:
         # Prefer a persistent hidden main root so the popup shows reliably.
         # show() creates its own veil + panel Toplevels owned by whichever
         # tk event loop is running, so we only need to schedule it.
+        # IMPORTANT: all tkinter work must happen on the UI thread that owns the
+        # root. We never create a second Tk root / event loop here, because
+        # stacking multiple roots on different threads is what can leave an
+        # orphaned, un-dismissable black overlay on screen.
         def schedule_show():
             self.warning_popup.show(message)
 
         if hasattr(self, "hidden_root") and self.hidden_root:
-            self.hidden_root.after(30, schedule_show)
+            try:
+                self.hidden_root.after(30, schedule_show)
+            except Exception as e:
+                logger.warning("[TrashPandaPatrol] Could not schedule warning: %s", e)
         else:
-            # Fallback standalone host with its own event loop.
-            def run_standalone():
-                temp = ctk.CTk()
-                temp.withdraw()
-                self.warning_popup.show(message)
-                temp.mainloop()
-            threading.Thread(target=run_standalone, daemon=True).start()
+            logger.warning("[TrashPandaPatrol] No UI root available; skipping warning popup.")
 
     def upload_image_temp(self, img_path: str) -> str:
         """
